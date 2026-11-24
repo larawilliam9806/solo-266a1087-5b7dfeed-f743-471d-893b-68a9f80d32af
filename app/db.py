@@ -10,11 +10,13 @@ so publishing a newer version never changes an older manifest.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from weakref import WeakKeyDictionary
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "supply.db"
 
@@ -113,3 +115,31 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.execute("COMMIT")
+
+
+_db_locks: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    WeakKeyDictionary()
+)
+
+
+def db_lock() -> asyncio.Lock:
+    """Lock serializing every SQLite call within the running event loop.
+
+    SQLite serializes work inside a single process anyway (each connection
+    takes an internal mutex, and WAL readers still contend with a writer's
+    commit), and letting dozens of worker threads block inside the C extension
+    can pin all worker threads for seconds when downloads start at once.
+    Funneling all database work through one asyncio lock makes callers wait on
+    the event loop instead, so a paused download never occupies a worker
+    thread while waiting for its next bounded read.
+
+    One lock is kept per running loop. A real deployment has a single loop for
+    the process lifetime; tests that spin up a new loop per client each get a
+    fresh lock instead of reusing one bound to a closed loop.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _db_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _db_locks[loop] = lock
+    return lock

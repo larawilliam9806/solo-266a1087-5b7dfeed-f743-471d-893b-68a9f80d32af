@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Iterator
+from typing import Any, Callable, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from anyio import to_thread
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import packing, service
-from .db import connect, database_path, init_db
+from .db import connect, database_path, db_lock, init_db
 from .models import Health, Manifest, ManifestList, TicketLimitError
 
 CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
@@ -20,20 +21,21 @@ def _open() -> sqlite3.Connection:
     return connect(database_path())
 
 
-def get_db() -> Iterator[sqlite3.Connection]:
-    """One SQLite connection per request (WAL: readers don't block writers)."""
-    conn = _open()
-    try:
-        yield conn
-    finally:
-        conn.close()
+async def _in_db(func: Callable[..., Any], *args: Any) -> Any:
+    """Run one SQLite-touching call on a worker thread, holding the DB lock.
+
+    The lock wait happens on the event loop (no worker thread is consumed),
+    and the worker thread is borrowed only for the short call itself.
+    """
+    async with db_lock():
+        return await to_thread.run_sync(func, *args)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conn = _open()
     try:
-        init_db(conn)
+        await _in_db(init_db, conn)
     finally:
         conn.close()
     yield
@@ -85,8 +87,15 @@ async def handle_ticket_too_large(
 
 
 @app.get("/health", response_model=Health, tags=["ops"])
-def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
-    conn.execute("SELECT 1").fetchone()
+async def health() -> Health:
+    def check() -> None:
+        conn = _open()
+        try:
+            conn.execute("SELECT 1").fetchone()
+        finally:
+            conn.close()
+
+    await _in_db(check)
     return Health(status="ok", database=str(database_path()))
 
 
@@ -102,25 +111,36 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> Health:
     },
     tags=["publish"],
 )
-def publish_batch(
+async def publish_batch(
     batch_id: str,
     tickets: UploadFile = File(..., description="工单 CSV：ticket_no,station"),
     parts: UploadFile = File(..., description="换件 CSV：ticket_no,part_code"),
     row_limit: int = Form(..., gt=0, description="每包行数上限"),
-    conn: sqlite3.Connection = Depends(get_db),
 ) -> Manifest:
     """接收同批两表与每包行数上限，校验后发布一个新清单版本。
 
     两表按工单号左连接，重复行各自保留，无换件的工单行也保留。任一工单
     连接后的行数超过上限时返回 422（含工单号与连接行数），本批不写库，
-    原清单继续有效。
+    原清单继续有效。只有整笔写事务提交成功后才返回新版本；失败时调用方
+    仍以最近一次成功发布的清单为准。
     """
     batch = service.require_batch_id(batch_id)
     limit = service.parse_row_limit(row_limit)
-    manifest = service.publish(
-        conn, batch, tickets.file.read(), parts.file.read(), limit
+    ticket_bytes, part_bytes = await to_thread.run_sync(
+        _read_uploads, tickets, parts
     )
+    conn = _open()
+    try:
+        manifest = await _in_db(
+            service.publish, conn, batch, ticket_bytes, part_bytes, limit
+        )
+    finally:
+        conn.close()
     return Manifest.model_validate(service.with_download_urls(manifest))
+
+
+def _read_uploads(tickets: UploadFile, parts: UploadFile) -> tuple[bytes, bytes]:
+    return tickets.file.read(), parts.file.read()
 
 
 @app.get(
@@ -128,12 +148,14 @@ def publish_batch(
     response_model=ManifestList,
     tags=["manifest"],
 )
-def list_batch_manifests(
-    batch_id: str, conn: sqlite3.Connection = Depends(get_db)
-) -> ManifestList:
+async def list_batch_manifests(batch_id: str) -> ManifestList:
     """列出版本号与各包首末工单号、行数；不展开连接明细。"""
     batch = service.require_batch_id(batch_id)
-    manifests = service.list_manifests(conn, batch)
+    conn = _open()
+    try:
+        manifests = await _in_db(service.list_manifests, conn, batch)
+    finally:
+        conn.close()
     return ManifestList(
         batch_id=batch,
         manifests=[
@@ -147,20 +169,24 @@ def list_batch_manifests(
     response_model=Manifest,
     tags=["manifest"],
 )
-def latest_batch_manifest(
-    batch_id: str, conn: sqlite3.Connection = Depends(get_db)
-) -> Manifest:
+async def latest_batch_manifest(batch_id: str) -> Manifest:
     batch = service.require_batch_id(batch_id)
-    manifest = service.latest_manifest(conn, batch)
+    conn = _open()
+    try:
+        manifest = await _in_db(service.latest_manifest, conn, batch)
+    finally:
+        conn.close()
     return Manifest.model_validate(service.with_download_urls(manifest))
 
 
 @app.get("/api/manifests/{version}", response_model=Manifest, tags=["manifest"])
-def get_manifest(
-    version: str, conn: sqlite3.Connection = Depends(get_db)
-) -> Manifest:
+async def get_manifest(version: str) -> Manifest:
     """按版本号查看清单；发布新版后旧清单仍可查询。"""
-    manifest = service.get_manifest(conn, version)
+    conn = _open()
+    try:
+        manifest = await _in_db(service.get_manifest, conn, version)
+    finally:
+        conn.close()
     return Manifest.model_validate(service.with_download_urls(manifest))
 
 
@@ -170,11 +196,13 @@ def get_manifest(
     responses={200: {"content": {CSV_MEDIA_TYPE: {}}}},
     tags=["manifest"],
 )
-def download_manifest_csv(
-    version: str, conn: sqlite3.Connection = Depends(get_db)
-) -> PlainTextResponse:
+async def download_manifest_csv(version: str) -> PlainTextResponse:
     """下载清单 CSV：版本号、各包首末工单号与行数（不展开明细）。"""
-    manifest = service.get_manifest(conn, version)
+    conn = _open()
+    try:
+        manifest = await _in_db(service.get_manifest, conn, version)
+    finally:
+        conn.close()
     return PlainTextResponse(
         service.manifest_csv(manifest),
         media_type=CSV_MEDIA_TYPE,
@@ -187,30 +215,46 @@ def download_manifest_csv(
     responses={200: {"content": {CSV_MEDIA_TYPE: {}}}},
     tags=["download"],
 )
-def download_package(version: str, package_no: int) -> StreamingResponse:
-    """按版本号与包号逐行下载本包 CSV，只读本包的源记录。"""
+async def download_package(version: str, package_no: int) -> StreamingResponse:
+    """Stream one package's CSV, reading only that version's source records.
+
+    The CSV is generated in the original row order and sent as it is produced.
+    Every SQLite access is a bounded batch run on a worker thread while the
+    process DB lock is held; between batches the stream yields back to the
+    event loop and releases both the lock and the worker thread. A client that
+    pauses receiving therefore only suspends the stream via transport
+    backpressure, while publishing still acquires the lock and commits.
+    An unknown version/package fails before the first byte is streamed (404).
+    """
     conn = _open()
     try:
-        # Resolve metadata first so an unknown version/package is a 404
-        # instead of an error halfway through the stream.
-        service.get_package_metadata(conn, version, package_no)
+        # Prepare the reader (metadata lookup + cursor) under the lock so an
+        # unknown version/package is a 404 before streaming starts.
+        reader = await _in_db(service.PackageCsvReader, conn, version, package_no)
     except BaseException:
         conn.close()
         raise
     return StreamingResponse(
-        _stream_package(conn, version, package_no),
+        _stream_package(conn, reader),
         media_type=CSV_MEDIA_TYPE,
         headers=_csv_headers(f"{version}-p{package_no}.csv"),
     )
 
 
-def _stream_package(
-    conn: sqlite3.Connection, version: str, package_no: int
-) -> Iterator[bytes]:
+async def _stream_package(
+    conn: sqlite3.Connection, reader: service.PackageCsvReader
+):
     try:
-        for chunk in service.iter_package_csv(conn, version, package_no):
+        yield reader.header().encode("utf-8")
+        while True:
+            # The lock is held only while one bounded batch is fetched; the
+            # await on yield (backpressure) happens with no lock and no worker.
+            chunk: Optional[str] = await _in_db(reader.read)
+            if chunk is None:
+                break
             yield chunk.encode("utf-8")
     finally:
+        await to_thread.run_sync(reader.close)
         conn.close()
 
 

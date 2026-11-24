@@ -1,6 +1,7 @@
 import csv
 import io
 import threading
+import time
 
 import pytest
 
@@ -364,3 +365,136 @@ def test_download_does_not_include_other_batches_same_ticket_numbers(client):
     v2 = client.get("/api/batches/b2/manifests/latest").json()
     assert rows(client.get(v1["packages"][0]["download_url"]).text)[1] == ["T1", "S1", "P1"]
     assert rows(client.get(v2["packages"][0]["download_url"]).text)[1] == ["T1", "S1", "P2"]
+
+
+def test_slow_download_clients_do_not_block_publish(client):
+    # A package big enough to keep every stalled stream suspended on
+    # backpressure well beyond the publish below.
+    tickets = "ticket_no,station\n" + "".join(
+        f"T{i:05d},S\n" for i in range(3000)
+    )
+    parts = "ticket_no,part_code\n" + "".join(
+        f"T{i:05d},P\n" for i in range(3000)
+    )
+    manifest = publish(client, tickets=tickets, parts=parts, row_limit="3000").json()
+    url = manifest["packages"][0]["download_url"]
+
+    stall = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def stalled_download():
+        try:
+            with client.stream("GET", url) as response:
+                assert response.status_code == 200
+                first = True
+                for _ in response.iter_bytes():
+                    if first:
+                        # Read the first chunk, then stop draining entirely:
+                        # the server side stays suspended on backpressure.
+                        stall.set()
+                        first = False
+                        release.wait(timeout=30)
+                        if not release.is_set():
+                            raise RuntimeError("stall timed out")
+        except Exception as exc:  # pragma: no cover - re-raised below
+            errors.append(exc)
+
+    # More concurrent stalls than the anyio default thread limiter (40).
+    workers = [threading.Thread(target=stalled_download) for _ in range(45)]
+    for worker in workers:
+        worker.start()
+    assert stall.wait(timeout=15), "slow clients never started streaming"
+    time.sleep(0.5)  # let every stream settle onto backpressure
+
+    # With sync streaming each stalled download keeps a worker pinned inside
+    # the SQLite cursor; the resulting convoy makes a publish take seconds
+    # (and on a single-loop uvicorn server it can be starved indefinitely).
+    # The async streamer only borrows a worker for bounded, lock-serialized
+    # batches, so the publish must finish promptly while all 45 downloads are
+    # still suspended.
+    def publish_while_stalled():
+        started = time.monotonic()
+        response = publish(client, tickets=tickets, parts=parts + "T00000,P2\n",
+                           row_limit="3000")
+        errors.append((response.status_code, time.monotonic() - started))
+
+    publisher = threading.Thread(target=publish_while_stalled)
+    publisher.start()
+    publisher.join(timeout=15)
+    assert not publisher.is_alive(), "publish starved by slow downloads"
+
+    release.set()
+    for worker in workers:
+        worker.join(timeout=15)
+        assert not worker.is_alive()
+
+    assert len(errors) == 1, errors
+    status_code, elapsed = errors[0]
+    assert status_code == 201, errors
+    # Old synchronous streaming measured 6+ seconds here; the fixed design
+    # stays well under that because waiting for the DB happens on the event
+    # loop instead of inside pinned worker threads.
+    assert elapsed < 3.0, f"publish took {elapsed:.2f}s under stalled downloads"
+
+    listing = client.get("/api/batches/b1/manifests").json()["manifests"]
+    assert [m["version"] for m in listing] == ["b1.v0002", "b1.v0001"]
+
+
+def test_started_download_completes_while_publish_transaction_is_open(client):
+    from app import db as db_module
+
+    tickets = "ticket_no,station\n" + "".join(
+        f"T{i:05d},S\n" for i in range(1500)
+    )
+    parts = "ticket_no,part_code\n" + "".join(
+        f"T{i:05d},P\n" for i in range(1500)
+    )
+    manifest = publish(client, tickets=tickets, parts=parts, row_limit="1500").json()
+    url = manifest["packages"][0]["download_url"]
+
+    # Hold an open, uncommitted writer transaction on the same database the
+    # whole time the download is being drained.
+    writer = db_module.connect()
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        writer.execute(
+            "INSERT INTO manifests (version, batch_id, seq, row_limit,"
+            " total_rows, ticket_count, package_count, created_at)"
+            " VALUES ('b1.v9999', 'b1', 9999, 1, 1, 1, 1, 'x')"
+        )
+        assert writer.in_transaction
+
+        body = client.get(url).text
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+    table = rows(body)
+    assert len(table) == 1501
+    assert table[0] == ["ticket_no", "station", "part_code"]
+    assert table[1] == ["T00000", "S", "P"]
+    assert table[-1] == ["T01499", "S", "P"]
+    # Only the pre-existing published version is visible; the uncommitted
+    # write never leaked into the read.
+    assert client.get("/api/manifests/b1.v9999").status_code == 404
+    assert client.get("/api/batches/b1/manifests/latest").json()["version"] == "b1.v0001"
+
+
+def test_failed_publish_keeps_latest_successful_manifest(client):
+    first = publish(client, tickets=TICKETS, parts=PARTS, row_limit="10")
+    assert first.status_code == 201
+    good_version = first.json()["version"]
+
+    # Oversized ticket: validation rejects the batch before any write.
+    response = publish(client, tickets=TICKETS, parts=PARTS, row_limit="3")
+    assert response.status_code == 422
+
+    latest = client.get("/api/batches/b1/manifests/latest")
+    assert latest.status_code == 200
+    assert latest.json()["version"] == good_version
+    body = rows(client.get(
+        f"/api/manifests/{good_version}/packages/1.csv"
+    ).text)
+    assert body[0] == ["ticket_no", "station", "part_code"]
+    assert len(body) - 1 == latest.json()["total_rows"]

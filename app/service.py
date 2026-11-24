@@ -7,14 +7,16 @@ import io
 import re
 import sqlite3
 from datetime import datetime, timezone
-from typing import Iterator, List
+from typing import List, Optional
 
 from . import packing
 from .db import transaction as db_transaction
 
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
-STREAM_CHUNK_BYTES = 64 * 1024
+# Each SQL fetch returns at most this many joined rows, keeping both the CSV
+# buffer and the time a worker thread is borrowed for a fetch bounded.
+PACKAGE_FETCH_BATCH_SIZE = 512
 
 
 class NotFound(Exception):
@@ -218,57 +220,73 @@ def get_package_metadata(
     raise NotFound(f"package {package_no} of manifest {version!r} not found")
 
 
-def iter_package_csv(
-    conn: sqlite3.Connection, version: str, package_no: int
-) -> Iterator[str]:
-    """Stream one package's CSV, reading only that package's source records.
+class PackageCsvReader:
+    """Batch reader streaming one package's CSV from its own source records.
 
-    The left join is replayed in SQL for the package's inclusive ticket-number
-    range only; a ticket number is never split across packages. Ticket order
-    is ascending, part order is the submitted order, and duplicate rows on
-    both sides are preserved. The package's recorded row count bounds the
-    output exactly.
+    The left join is replayed in SQL for the package's inclusive
+    ticket-number range only; a ticket number is never split across packages.
+    Ticket order is ascending, part order is the submitted order, and
+    duplicate rows on both sides are preserved. The package's recorded row
+    count bounds the output exactly.
+
+    All blocking SQLite work happens inside :meth:`read`, which fetches a
+    bounded batch per call. Callers run that method on a worker thread and
+    await backpressure between batches, so a client that stops reading never
+    pins a thread: the worker is released while the event loop is suspended.
     """
-    bounds = get_package_metadata(conn, version, package_no)
-    first = bounds["first_ticket_no"]
-    last = bounds["last_ticket_no"]
-    expected = bounds["row_count"]
 
-    yield packing.detail_csv_header()
-
-    buffer = io.StringIO(newline="")
-    writer = csv.writer(buffer)
-    emitted = 0
-
-    rows = conn.execute(
-        "SELECT t.ticket_no, t.station, p.part_code"
-        " FROM tickets AS t"
-        " LEFT JOIN parts AS p"
-        "   ON p.version = t.version AND p.ticket_no = t.ticket_no"
-        " WHERE t.version = ? AND t.ticket_no >= ? AND t.ticket_no <= ?"
-        " ORDER BY t.ticket_no, t.position, p.position",
-        (version, first, last),
-    )
-    for row in rows:
-        writer.writerow(
-            [
-                row["ticket_no"],
-                row["station"],
-                "" if row["part_code"] is None else row["part_code"],
-            ]
+    def __init__(
+        self, conn: sqlite3.Connection, version: str, package_no: int
+    ) -> None:
+        bounds = get_package_metadata(conn, version, package_no)
+        self._conn = conn
+        self._version = version
+        self._package_no = package_no
+        self._expected = bounds["row_count"]
+        self._emitted = 0
+        self._buffer = io.StringIO(newline="")
+        self._writer = csv.writer(self._buffer)
+        self._rows = conn.execute(
+            "SELECT t.ticket_no, t.station, p.part_code"
+            " FROM tickets AS t"
+            " LEFT JOIN parts AS p"
+            "   ON p.version = t.version AND p.ticket_no = t.ticket_no"
+            " WHERE t.version = ? AND t.ticket_no >= ? AND t.ticket_no <= ?"
+            " ORDER BY t.ticket_no, t.position, p.position",
+            (version, bounds["first_ticket_no"], bounds["last_ticket_no"]),
         )
-        emitted += 1
 
-        if buffer.tell() >= STREAM_CHUNK_BYTES:
-            yield buffer.getvalue()
-            buffer.seek(0)
-            buffer.truncate(0)
+    @staticmethod
+    def header() -> str:
+        return packing.detail_csv_header()
 
-    if emitted != expected:
-        raise CorruptSnapshot(
-            f"package {package_no} of manifest {version!r} expected {expected}"
-            f" rows but read {emitted}"
-        )
-    remainder = buffer.getvalue()
-    if remainder:
-        yield remainder
+    def read(self) -> Optional[str]:
+        """Fetch and render one batch; return ``None`` at the end.
+
+        Raises :class:`CorruptSnapshot` if the stored source rows do not
+        reproduce the package's recorded row count.
+        """
+        for row in self._rows.fetchmany(PACKAGE_FETCH_BATCH_SIZE):
+            self._writer.writerow(
+                [
+                    row["ticket_no"],
+                    row["station"],
+                    "" if row["part_code"] is None else row["part_code"],
+                ]
+            )
+            self._emitted += 1
+
+        chunk = self._buffer.getvalue()
+        self._buffer.seek(0)
+        self._buffer.truncate(0)
+        if chunk:
+            return chunk
+        if self._emitted != self._expected:
+            raise CorruptSnapshot(
+                f"package {self._package_no} of manifest {self._version!r}"
+                f" expected {self._expected} rows but read {self._emitted}"
+            )
+        return None
+
+    def close(self) -> None:
+        self._rows.close()
